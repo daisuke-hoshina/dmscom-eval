@@ -12,6 +12,7 @@ import time
 from pathlib import Path
 from typing import Iterable, Iterator, List, Optional, Tuple
 
+import igraph as ig
 import librosa
 import numpy as np
 
@@ -138,6 +139,119 @@ def extract_features_from_path(
     return audio, rate, feats
 
 
+def compute_similarity_matrices(
+    features: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Compute recurrence (R) and proximity (Δ) similarity matrices.
+
+    Parameters
+    ----------
+    features : np.ndarray, shape (n_frames, n_dims)
+        Frame-level features from extract_features().
+
+    Returns
+    -------
+    R : np.ndarray, shape (n_frames, n_frames)
+        Recurrence similarity matrix (cosine similarity, diagonal zeroed).
+    Delta : np.ndarray, shape (n_frames, n_frames)
+        Proximity matrix connecting only temporally adjacent frames.
+    """
+
+    X = np.asarray(features)
+    if X.ndim != 2:
+        raise ValueError("features must be a 2D array with shape (n_frames, n_dims)")
+
+    # L2-normalize per frame, guarding against zero rows.
+    norms = np.linalg.norm(X, axis=1, keepdims=True)
+    norms = np.where(norms == 0, 1.0, norms)
+    Xn = X / norms
+
+    R = Xn @ Xn.T
+    np.fill_diagonal(R, 0.0)
+
+    n_frames = X.shape[0]
+    Delta = np.zeros_like(R)
+    for i in range(n_frames - 1):
+        d = np.linalg.norm(X[i] - X[i + 1])
+        w = float(np.exp(-d))
+        Delta[i, i + 1] = w
+        Delta[i + 1, i] = w
+
+    return R, Delta
+
+
+def build_graph_from_matrices(
+    R: np.ndarray,
+    Delta: np.ndarray,
+    k: int = 10,
+    alpha: float = 0.5,
+):
+    """
+    Build an undirected weighted graph G from recurrence and proximity matrices.
+
+    Parameters
+    ----------
+    R : np.ndarray, shape (n_frames, n_frames)
+        Recurrence similarity matrix.
+    Delta : np.ndarray, shape (n_frames, n_frames)
+        Proximity matrix.
+    k : int
+        Number of strongest recurrence neighbors to keep per node.
+    alpha : float
+        Weighting factor between recurrence and proximity when combining.
+
+    Returns
+    -------
+    G : igraph.Graph
+        Undirected weighted graph with 'weight' edge attributes.
+    """
+
+    if R.shape != Delta.shape or R.ndim != 2 or R.shape[0] != R.shape[1]:
+        raise ValueError("R and Delta must be square matrices of the same shape")
+
+    n_frames = R.shape[0]
+    g = ig.Graph(n=n_frames, directed=False)
+
+    edge_weights: dict[tuple[int, int], float] = {}
+
+    # Add top-k recurrence edges per node.
+    for i in range(n_frames):
+        row = R[i].copy()
+        row[i] = -np.inf
+        if k < row.size:
+            top_k_indices = np.argpartition(row, -k)[-k:]
+        else:
+            top_k_indices = np.arange(n_frames)
+
+        for j in top_k_indices:
+            if j == i:
+                continue
+            w_rec = float(R[i, j])
+            key = (min(i, j), max(i, j))
+            edge_weights[key] = w_rec
+
+    # Add proximity edges.
+    prox_indices = np.argwhere(Delta > 0)
+    for i, j in prox_indices:
+        if i == j:
+            continue
+        w_prox = float(Delta[i, j])
+        key = (min(i, j), max(i, j))
+        if key in edge_weights:
+            edge_weights[key] = alpha * edge_weights[key] + (1.0 - alpha) * w_prox
+        else:
+            edge_weights[key] = w_prox
+
+    edge_list = list(edge_weights.keys())
+    weight_list = list(edge_weights.values())
+
+    g.add_edges(edge_list)
+    g.es["weight"] = weight_list
+
+    return g
+
+
 def ensure_dir(path: str | Path) -> Path:
     path = Path(path)
     path.mkdir(parents=True, exist_ok=True)
@@ -223,6 +337,8 @@ __all__ = [
     "load_audio",
     "extract_features",
     "extract_features_from_path",
+    "compute_similarity_matrices",
+    "build_graph_from_matrices",
     "ensure_dir",
     "save_numpy",
     "save_csv",
