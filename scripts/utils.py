@@ -252,6 +252,61 @@ def build_graph_from_matrices(
     return g
 
 
+def run_multilevel_community_detection(
+    graph: ig.Graph, num_levels: int = 5
+) -> np.ndarray:
+    """
+    Run multi-resolution community detection on a graph and return a label matrix.
+
+    Parameters
+    ----------
+    graph : ig.Graph
+        Undirected weighted graph with 'weight' edge attributes.
+    num_levels : int
+        Number of resolution levels to compute.
+
+    Returns
+    -------
+    label_matrix : np.ndarray, shape (n_levels, n_frames)
+        Each row corresponds to one resolution level; each column is a node/frame.
+        Entries are integer community labels (0..C_l-1 for each level l).
+    """
+
+    if graph.ecount() == 0 or graph.vcount() == 0:
+        return np.zeros((0, graph.vcount()), dtype=int)
+
+    weights = np.asarray(graph.es["weight"], dtype=float)
+    w_min = float(weights.min())
+    w_max = float(weights.max())
+    thresholds = np.linspace(w_min, w_max, num_levels)
+
+    level_memberships: list[np.ndarray] = []
+    for thr in thresholds:
+        keep_idx = np.where(weights >= thr)[0]
+        if keep_idx.size == 0:
+            labels = np.arange(graph.vcount(), dtype=int)
+            level_memberships.append(labels)
+            continue
+
+        edge_tuples = [graph.es[i].tuple for i in keep_idx]
+        g_thr = ig.Graph(n=graph.vcount(), edges=edge_tuples, directed=False)
+        g_thr.es["weight"] = [float(weights[i]) for i in keep_idx]
+
+        if g_thr.ecount() == 0:
+            labels = np.arange(graph.vcount(), dtype=int)
+        else:
+            communities = g_thr.community_multilevel(weights=g_thr.es["weight"])
+            labels = np.asarray(communities.membership, dtype=int)
+
+        level_memberships.append(labels)
+
+    if not level_memberships:
+        return np.zeros((0, graph.vcount()), dtype=int)
+
+    label_matrix = np.stack(level_memberships, axis=0)
+    return label_matrix
+
+
 def ensure_dir(path: str | Path) -> Path:
     path = Path(path)
     path.mkdir(parents=True, exist_ok=True)
@@ -339,6 +394,7 @@ __all__ = [
     "extract_features_from_path",
     "compute_similarity_matrices",
     "build_graph_from_matrices",
+    "run_multilevel_community_detection",
     "ensure_dir",
     "save_numpy",
     "save_csv",
