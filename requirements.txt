@@ -1,0 +1,9 @@
+numpy
+scipy
+pandas
+librosa
+scikit-learn
+matplotlib
+tqdm
+networkx
+igraph
