@@ -89,6 +89,55 @@ def load_audio(path: str, sr: Optional[int] = None) -> Tuple[np.ndarray, int]:
     return audio, rate
 
 
+def extract_features(
+    audio: np.ndarray,
+    sr: int,
+    hop_length: int = 1024,
+    n_mfcc: int = 13,
+) -> np.ndarray:
+    """Compute chroma + MFCC features aligned per frame.
+
+    The extractor is intentionally lightweight: it combines ``chroma_cqt`` and
+    MFCCs with a shared hop length, concatenates them, transposes to
+    ``(n_frames, n_features)``, and performs simple per-frame L2 normalization
+    for robustness.
+    """
+
+    chroma = librosa.feature.chroma_cqt(y=audio, sr=sr, hop_length=hop_length)
+    mfcc = librosa.feature.mfcc(
+        y=audio, sr=sr, n_mfcc=n_mfcc, hop_length=hop_length
+    )
+
+    # Ensure equal frame counts by truncating to the shortest sequence.
+    n_frames = min(chroma.shape[1], mfcc.shape[1])
+    if chroma.shape[1] != n_frames:
+        chroma = chroma[:, :n_frames]
+    if mfcc.shape[1] != n_frames:
+        mfcc = mfcc[:, :n_frames]
+
+    features = np.concatenate([chroma, mfcc], axis=0).T  # (frames, dims)
+
+    # Per-frame L2 normalization to stabilize scale across frames.
+    norms = np.linalg.norm(features, axis=1, keepdims=True)
+    norms = np.where(norms == 0, 1.0, norms)
+    features = features / norms
+
+    return features
+
+
+def extract_features_from_path(
+    path: str | Path, sr: int | None = None
+) -> tuple[np.ndarray, int, np.ndarray]:
+    """Load audio then compute features.
+
+    Returns a tuple ``(audio, sr, features)`` for convenience.
+    """
+
+    audio, rate = load_audio(str(path), sr=sr)
+    feats = extract_features(audio, rate)
+    return audio, rate, feats
+
+
 def ensure_dir(path: str | Path) -> Path:
     path = Path(path)
     path.mkdir(parents=True, exist_ok=True)
@@ -172,6 +221,8 @@ def convert_labels_to_tree(label_matrix: np.ndarray) -> TreeNode:
 __all__ = [
     "TreeNode",
     "load_audio",
+    "extract_features",
+    "extract_features_from_path",
     "ensure_dir",
     "save_numpy",
     "save_csv",
