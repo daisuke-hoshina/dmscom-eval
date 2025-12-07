@@ -307,6 +307,41 @@ def run_multilevel_community_detection(
     return label_matrix
 
 
+def DMSCOM(
+    features: np.ndarray,
+    num_levels: int = 5,
+    k: int = 10,
+    alpha: float = 0.5,
+) -> np.ndarray:
+    """Lightweight DMSCOM wrapper: from features to hierarchical label matrix.
+
+    Parameters
+    ----------
+    features : np.ndarray, shape (n_frames, n_dims)
+        Frame-level features from `extract_features()`.
+    num_levels : int
+        Number of community resolution levels.
+    k : int
+        Number of strongest recurrence neighbors per node when building the graph.
+    alpha : float
+        Mixing factor between recurrence and proximity weights in the graph.
+
+    Returns
+    -------
+    label_matrix : np.ndarray, shape (n_levels, n_frames)
+        Each row is a level, each column is a frame index, with integer community labels.
+    """
+
+    X = np.asarray(features)
+    if X.size == 0:
+        return np.zeros((0, 0), dtype=int)
+
+    R, Delta = compute_similarity_matrices(X)
+    graph = build_graph_from_matrices(R, Delta, k=k, alpha=alpha)
+    label_matrix = run_multilevel_community_detection(graph, num_levels=num_levels)
+    return label_matrix
+
+
 def ensure_dir(path: str | Path) -> Path:
     path = Path(path)
     path.mkdir(parents=True, exist_ok=True)
@@ -395,6 +430,7 @@ __all__ = [
     "compute_similarity_matrices",
     "build_graph_from_matrices",
     "run_multilevel_community_detection",
+    "DMSCOM",
     "ensure_dir",
     "save_numpy",
     "save_csv",
