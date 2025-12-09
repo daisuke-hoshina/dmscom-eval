@@ -256,7 +256,10 @@ def run_multilevel_community_detection(
     graph: ig.Graph, num_levels: int = 5
 ) -> np.ndarray:
     """
-    Run multi-resolution community detection on a graph and return a label matrix.
+    Run flat multi-resolution community detection on a graph and return a label matrix.
+
+    This variant thresholds the entire graph independently per level without
+    enforcing parent/child relationships across levels.
 
     Parameters
     ----------
@@ -307,6 +310,103 @@ def run_multilevel_community_detection(
     return label_matrix
 
 
+def run_hierarchical_community_detection(
+    graph: ig.Graph,
+    num_levels: int = 5,
+    low_percentile: float = 30.0,
+    high_percentile: float = 90.0,
+    min_community_size: int = 16,
+) -> np.ndarray:
+    """Hierarchical community detection that splits each parent community.
+
+    Level 0 runs Louvain once on the full graph. Higher levels re-cluster each
+    parent community's induced subgraph using a thresholded edge set so that
+    children are always contained within their parent community. The
+    ``min_community_size`` guard prevents over-fragmentation and
+    ``low_percentile``/``high_percentile`` control the threshold sweep range.
+    """
+
+    n_vertices = graph.vcount()
+    if n_vertices == 0:
+        return np.zeros((num_levels, 0), dtype=int)
+
+    # Level 0: single community detection over the full graph.
+    if graph.ecount() == 0:
+        labels0 = np.arange(n_vertices, dtype=int)
+    else:
+        communities0 = graph.community_multilevel(weights=graph.es["weight"])
+        labels0 = np.asarray(communities0.membership, dtype=int)
+
+    label_matrix = np.empty((num_levels, n_vertices), dtype=int)
+    label_matrix[0] = labels0
+    current_labels = labels0
+
+    # Prepare thresholds from the global edge weights.
+    if graph.ecount() == 0:
+        thresholds = np.zeros(max(num_levels - 1, 1), dtype=float)
+    else:
+        weights = np.asarray(graph.es["weight"], dtype=float)
+        lo = float(np.percentile(weights, low_percentile))
+        hi = float(np.percentile(weights, high_percentile))
+        thresholds = np.linspace(lo, hi, max(num_levels - 1, 1))
+
+    for level_idx in range(1, num_levels):
+        thr = thresholds[min(level_idx - 1, thresholds.size - 1)]
+        new_labels = np.empty(n_vertices, dtype=int)
+        new_labels.fill(-1)
+        next_label = 0
+
+        for parent_id in np.unique(current_labels):
+            nodes = np.where(current_labels == parent_id)[0]
+            if nodes.size == 0:
+                continue
+
+            if nodes.size < min_community_size:
+                new_labels[nodes] = next_label
+                next_label += 1
+                continue
+
+            subg = graph.induced_subgraph(nodes)
+            weights_sub = np.asarray(subg.es["weight"], dtype=float)
+
+            keep_idx = np.where(weights_sub >= thr)[0]
+            if keep_idx.size == 0:
+                new_labels[nodes] = next_label
+                next_label += 1
+                continue
+
+            sub_edges = [subg.es[i].tuple for i in keep_idx]
+            subg_thr = ig.Graph(n=subg.vcount(), edges=sub_edges, directed=False)
+            subg_thr.es["weight"] = [float(weights_sub[i]) for i in keep_idx]
+
+            if subg_thr.ecount() == 0:
+                new_labels[nodes] = next_label
+                next_label += 1
+                continue
+
+            communities = subg_thr.community_multilevel(weights=subg_thr.es["weight"])
+            membership = np.asarray(communities.membership, dtype=int)
+            uniq, counts = np.unique(membership, return_counts=True)
+
+            valid_clusters = counts[counts >= min_community_size]
+            if uniq.size < 2 or valid_clusters.size < 2:
+                new_labels[nodes] = next_label
+                next_label += 1
+                continue
+
+            for cluster_id in uniq:
+                cluster_nodes_local = np.where(membership == cluster_id)[0]
+                cluster_nodes_global = nodes[cluster_nodes_local]
+                new_labels[cluster_nodes_global] = next_label
+                next_label += 1
+
+        assert np.all(new_labels >= 0)
+        label_matrix[level_idx] = new_labels
+        current_labels = new_labels
+
+    return label_matrix
+
+
 def DMSCOM(
     features: np.ndarray,
     num_levels: int = 5,
@@ -338,7 +438,10 @@ def DMSCOM(
 
     R, Delta = compute_similarity_matrices(X)
     graph = build_graph_from_matrices(R, Delta, k=k, alpha=alpha)
-    label_matrix = run_multilevel_community_detection(graph, num_levels=num_levels)
+    label_matrix = run_hierarchical_community_detection(
+        graph,
+        num_levels=num_levels,
+    )
     return label_matrix
 
 
@@ -430,6 +533,7 @@ __all__ = [
     "compute_similarity_matrices",
     "build_graph_from_matrices",
     "run_multilevel_community_detection",
+    "run_hierarchical_community_detection",
     "DMSCOM",
     "ensure_dir",
     "save_numpy",
