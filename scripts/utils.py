@@ -313,9 +313,9 @@ def run_multilevel_community_detection(
 def run_hierarchical_community_detection(
     graph: ig.Graph,
     num_levels: int = 5,
-    low_percentile: float = 30.0,
-    high_percentile: float = 90.0,
-    min_community_size: int = 16,
+    low_percentile: float = 10.0,
+    high_percentile: float = 80.0,
+    min_community_size: int = 64,
 ) -> np.ndarray:
     """Hierarchical community detection that splits each parent community.
 
@@ -412,6 +412,7 @@ def DMSCOM(
     num_levels: int = 5,
     k: int = 10,
     alpha: float = 0.5,
+    min_segment_frames: int | None = None,
 ) -> np.ndarray:
     """Lightweight DMSCOM wrapper: from features to hierarchical label matrix.
 
@@ -425,6 +426,9 @@ def DMSCOM(
         Number of strongest recurrence neighbors per node when building the graph.
     alpha : float
         Mixing factor between recurrence and proximity weights in the graph.
+    min_segment_frames : int or None
+        If not None and > 0, merge segments shorter than this many frames in
+        each level (postprocessing in the time domain).
 
     Returns
     -------
@@ -442,6 +446,8 @@ def DMSCOM(
         graph,
         num_levels=num_levels,
     )
+    if min_segment_frames is not None and min_segment_frames > 0:
+        label_matrix = postprocess_label_matrix(label_matrix, min_segment_frames)
     return label_matrix
 
 
@@ -525,6 +531,89 @@ def convert_labels_to_tree(label_matrix: np.ndarray) -> TreeNode:
     return root
 
 
+def merge_short_segments(labels: np.ndarray, min_segment_frames: int) -> np.ndarray:
+    """Merge contiguous runs shorter than min_segment_frames into their neighbors.
+
+    Parameters
+    ----------
+    labels : np.ndarray, shape (n_frames,)
+        1D array of integer community labels for a single level.
+    min_segment_frames : int
+        Minimum allowed segment length in frames. Any contiguous run of
+        identical labels shorter than this will be merged into its left
+        and/or right neighbor.
+
+    Returns
+    -------
+    np.ndarray
+        New 1D label array with short segments merged. The input is not modified.
+    """
+
+    labels_clean = np.asarray(labels).copy()
+    if labels_clean.size == 0:
+        return labels_clean
+
+    n = labels_clean.size
+    idx = 0
+    while idx < n:
+        start = idx
+        current_label = labels_clean[start]
+        while idx < n and labels_clean[idx] == current_label:
+            idx += 1
+        end = idx
+        run_length = end - start
+
+        if run_length >= min_segment_frames:
+            continue
+
+        left_label = labels_clean[start - 1] if start > 0 else None
+        right_label = labels_clean[end] if end < n else None
+
+        if left_label is None and right_label is None:
+            break
+        if left_label is None:
+            labels_clean[start:end] = right_label
+            continue
+        if right_label is None:
+            labels_clean[start:end] = left_label
+            idx = start
+            continue
+
+        left_run_start = start - 1
+        while left_run_start >= 0 and labels_clean[left_run_start] == left_label:
+            left_run_start -= 1
+        left_run_length = start - (left_run_start + 1)
+
+        right_run_end = end
+        while right_run_end < n and labels_clean[right_run_end] == right_label:
+            right_run_end += 1
+        right_run_length = right_run_end - end
+
+        if left_run_length >= right_run_length:
+            labels_clean[start:end] = left_label
+            idx = start
+        else:
+            labels_clean[start:end] = right_label
+            idx = start
+
+    return labels_clean
+
+
+def postprocess_label_matrix(label_matrix: np.ndarray, min_segment_frames: int) -> np.ndarray:
+    """Apply merge_short_segments row-wise to a (n_levels, n_frames) label matrix."""
+
+    labels_copy = np.asarray(label_matrix).copy()
+    if labels_copy.ndim != 2 or labels_copy.shape[1] == 0:
+        return labels_copy
+
+    for level_idx in range(labels_copy.shape[0]):
+        labels_copy[level_idx] = merge_short_segments(
+            labels_copy[level_idx], min_segment_frames
+        )
+
+    return labels_copy
+
+
 __all__ = [
     "TreeNode",
     "load_audio",
@@ -535,6 +624,8 @@ __all__ = [
     "run_multilevel_community_detection",
     "run_hierarchical_community_detection",
     "DMSCOM",
+    "merge_short_segments",
+    "postprocess_label_matrix",
     "ensure_dir",
     "save_numpy",
     "save_csv",
