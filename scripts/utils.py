@@ -10,7 +10,7 @@ import dataclasses
 import os
 import time
 from pathlib import Path
-from typing import Iterable, Iterator, List, Optional, Tuple
+from typing import Iterable, Iterator, List, Optional, Sequence, Tuple
 
 import igraph as ig
 import librosa
@@ -90,18 +90,21 @@ def load_audio(path: str, sr: Optional[int] = None) -> Tuple[np.ndarray, int]:
     return audio, rate
 
 
-def extract_features(
+def extract_features_with_meta(
     audio: np.ndarray,
     sr: int,
     hop_length: int = 1024,
     n_mfcc: int = 13,
-) -> np.ndarray:
-    """Compute chroma + MFCC features aligned per frame.
+    target_hop_sec: float | None = 0.5,
+    pool_agg: str = "median",
+) -> tuple[np.ndarray, dict]:
+    """Compute pooled chroma + MFCC features with metadata.
 
-    The extractor is intentionally lightweight: it combines ``chroma_cqt`` and
-    MFCCs with a shared hop length, concatenates them, transposes to
-    ``(n_frames, n_features)``, and performs simple per-frame L2 normalization
-    for robustness.
+    The extractor computes chroma and MFCCs on a common hop length, concatenates
+    them into frame-wise feature vectors, and optionally performs temporal
+    pooling to reduce time resolution. Pooling aggregates consecutive frames by
+    median (default) or mean and returns the pooled feature matrix along with
+    metadata describing the effective hop duration.
     """
 
     chroma = librosa.feature.chroma_cqt(y=audio, sr=sr, hop_length=hop_length)
@@ -123,7 +126,65 @@ def extract_features(
     norms = np.where(norms == 0, 1.0, norms)
     features = features / norms
 
-    return features
+    base_hop_sec = hop_length / float(sr)
+    pool_size = 1
+    if target_hop_sec is not None:
+        pool_size = max(1, int(round(target_hop_sec / base_hop_sec)))
+    if pool_size > 1:
+        pooled_frames: list[np.ndarray] = []
+        for start in range(0, features.shape[0], pool_size):
+            end = min(start + pool_size, features.shape[0])
+            slice_ = features[start:end]
+            if pool_agg == "mean":
+                pooled = slice_.mean(axis=0)
+            else:
+                pooled = np.median(slice_, axis=0)
+            pooled_frames.append(pooled)
+
+        features = np.vstack(pooled_frames)
+
+        # Re-normalize pooled frames for stability.
+        norms = np.linalg.norm(features, axis=1, keepdims=True)
+        norms = np.where(norms == 0, 1.0, norms)
+        features = features / norms
+
+    effective_hop_sec = base_hop_sec * pool_size
+    meta = {
+        "sr": sr,
+        "hop_length": hop_length,
+        "pool_size": pool_size,
+        "effective_hop_sec": effective_hop_sec,
+        "target_hop_sec": target_hop_sec,
+        "pool_agg": pool_agg,
+        "n_chroma": 12,
+        "n_mfcc": n_mfcc,
+        "feature_slices": {
+            "chroma": (0, 12),
+            "mfcc": (12, 12 + n_mfcc),
+        },
+    }
+    return features, meta
+
+
+def extract_features(
+    audio: np.ndarray,
+    sr: int,
+    hop_length: int = 1024,
+    n_mfcc: int = 13,
+    target_hop_sec: float | None = None,
+    pool_agg: str = "median",
+) -> np.ndarray:
+    """Backward compatible wrapper returning features only."""
+
+    feats, _ = extract_features_with_meta(
+        audio,
+        sr,
+        hop_length=hop_length,
+        n_mfcc=n_mfcc,
+        target_hop_sec=target_hop_sec,
+        pool_agg=pool_agg,
+    )
+    return feats
 
 
 def extract_features_from_path(
@@ -141,42 +202,85 @@ def extract_features_from_path(
 
 def compute_similarity_matrices(
     features: np.ndarray,
+    feature_slices: dict[str, tuple[int, int]] | None = None,
+    max_proximity_hop: int = 1,
+    max_dense_frames: int = 5000,
 ) -> tuple[np.ndarray, np.ndarray]:
     """
     Compute recurrence (R) and proximity (Δ) similarity matrices.
+
+    Recurrence is computed on chroma features via cosine similarity, while
+    proximity weights come from MFCC distances with an exponential decay. A
+    safety guard prevents accidentally materializing extremely large dense
+    matrices.
 
     Parameters
     ----------
     features : np.ndarray, shape (n_frames, n_dims)
         Frame-level features from extract_features().
+    feature_slices : dict[str, tuple[int, int]] | None
+        Optional mapping defining column ranges for feature subsets. If None,
+        chroma is assumed to occupy [0, 12) and MFCC the remainder.
+    max_proximity_hop : int
+        Maximum temporal hop to connect when constructing the proximity band.
+    max_dense_frames : int
+        Maximum number of frames allowed before raising to avoid dense blow-up.
 
     Returns
     -------
     R : np.ndarray, shape (n_frames, n_frames)
         Recurrence similarity matrix (cosine similarity, diagonal zeroed).
     Delta : np.ndarray, shape (n_frames, n_frames)
-        Proximity matrix connecting only temporally adjacent frames.
+        Proximity matrix connecting temporally nearby frames.
     """
 
     X = np.asarray(features)
     if X.ndim != 2:
         raise ValueError("features must be a 2D array with shape (n_frames, n_dims)")
 
-    # L2-normalize per frame, guarding against zero rows.
-    norms = np.linalg.norm(X, axis=1, keepdims=True)
-    norms = np.where(norms == 0, 1.0, norms)
-    Xn = X / norms
+    n_frames, n_dims = X.shape
+    if n_frames > max_dense_frames:
+        raise ValueError(
+            "Too many frames for dense similarity computation; "
+            "enable pooling with --target-hop-sec (e.g., 0.5) or increase it to reduce frames."
+        )
 
-    R = Xn @ Xn.T
+    slices = feature_slices or {"chroma": (0, 12), "mfcc": (12, n_dims)}
+    chroma_slice = slices.get("chroma", (0, min(12, n_dims)))
+    mfcc_slice = slices.get("mfcc", (chroma_slice[1], n_dims))
+
+    chroma_feats = X[:, chroma_slice[0] : chroma_slice[1]]
+    mfcc_feats = X[:, mfcc_slice[0] : mfcc_slice[1]]
+
+    # Normalize to guard cosine similarity stability.
+    chroma_norms = np.linalg.norm(chroma_feats, axis=1, keepdims=True)
+    chroma_norms = np.where(chroma_norms == 0, 1.0, chroma_norms)
+    chroma_normed = chroma_feats / chroma_norms
+
+    R = chroma_normed @ chroma_normed.T
     np.fill_diagonal(R, 0.0)
 
-    n_frames = X.shape[0]
+    mfcc_norms = np.linalg.norm(mfcc_feats, axis=1, keepdims=True)
+    mfcc_norms = np.where(mfcc_norms == 0, 1.0, mfcc_norms)
+    mfcc_normed = mfcc_feats / mfcc_norms
+
+    if n_frames < 2:
+        return R, np.zeros_like(R)
+
+    neighbor_dists = np.linalg.norm(mfcc_normed[1:] - mfcc_normed[:-1], axis=1)
+    sigma = float(np.median(neighbor_dists)) + 1e-6
+
     Delta = np.zeros_like(R)
-    for i in range(n_frames - 1):
-        d = np.linalg.norm(X[i] - X[i + 1])
-        w = float(np.exp(-d))
-        Delta[i, i + 1] = w
-        Delta[i + 1, i] = w
+    for hop in range(1, max_proximity_hop + 1):
+        if hop >= n_frames:
+            break
+        offsets = mfcc_normed[hop:] - mfcc_normed[:-hop]
+        dists = np.linalg.norm(offsets, axis=1)
+        weights = np.exp(-dists / sigma)
+        i_idx = np.arange(n_frames - hop)
+        j_idx = i_idx + hop
+        Delta[i_idx, j_idx] = weights
+        Delta[j_idx, i_idx] = weights
 
     return R, Delta
 
@@ -186,6 +290,11 @@ def build_graph_from_matrices(
     Delta: np.ndarray,
     k: int = 10,
     alpha: float = 0.5,
+    exclude_radius: int = 0,
+    mutual_knn: bool = True,
+    min_rec_sim: float = 0.0,
+    chain_weight: float = 0.8,
+    chain_hops: int = 1,
 ):
     """
     Build an undirected weighted graph G from recurrence and proximity matrices.
@@ -200,6 +309,16 @@ def build_graph_from_matrices(
         Number of strongest recurrence neighbors to keep per node.
     alpha : float
         Weighting factor between recurrence and proximity when combining.
+    exclude_radius : int
+        Number of frames to exclude around the diagonal when selecting recurrence edges.
+    mutual_knn : bool
+        If True, keep only mutual recurrence neighbors.
+    min_rec_sim : float
+        Minimum recurrence similarity for an edge to be considered.
+    chain_weight : float
+        Weight for temporal chain edges.
+    chain_hops : int
+        Number of forward hops to connect in the temporal chain.
 
     Returns
     -------
@@ -215,29 +334,45 @@ def build_graph_from_matrices(
 
     edge_weights: dict[tuple[int, int], float] = {}
 
-    # Add top-k recurrence edges per node.
+    # Precompute neighbor candidates for recurrence edges with exclusion radius.
+    neighbor_sets: list[set[int]] = []
     for i in range(n_frames):
         row = R[i].copy()
-        row[i] = -np.inf
-        if k < row.size:
-            top_k_indices = np.argpartition(row, -k)[-k:]
-        else:
-            top_k_indices = np.arange(n_frames)
+        mask = np.ones_like(row, dtype=bool)
+        idxs = np.arange(n_frames)
+        mask[np.abs(idxs - i) <= exclude_radius] = False
+        row[~mask] = -np.inf
+        row[row <= min_rec_sim] = -np.inf
 
-        for j in top_k_indices:
-            if j == i:
+        if k < row.size:
+            candidate_idx = np.argpartition(row, -k)[-k:]
+        else:
+            candidate_idx = np.where(row > -np.inf)[0]
+
+        # Filter out any -inf leftovers after partitioning.
+        valid_idx = [int(j) for j in candidate_idx if row[j] > -np.inf]
+        neighbor_sets.append(set(valid_idx))
+
+    # Add top-k recurrence edges per node, optionally keeping only mutual ones.
+    for i, neighbors in enumerate(neighbor_sets):
+        for j in neighbors:
+            if mutual_knn and i not in neighbor_sets[j]:
+                continue
+            if i == j:
                 continue
             w_rec = float(R[i, j])
+            if w_rec <= 0:
+                continue
             key = (min(i, j), max(i, j))
             edge_weights[key] = w_rec
 
-    # Add proximity edges.
-    prox_indices = np.argwhere(Delta > 0)
-    for i, j in prox_indices:
-        if i == j:
+    # Add proximity edges derived from Delta (scaled by chain_weight).
+    nz_upper = np.argwhere(np.triu(Delta, k=1) > 0)
+    for i, j in nz_upper:
+        w_prox = float(chain_weight * Delta[i, j])
+        if w_prox <= 0:
             continue
-        w_prox = float(Delta[i, j])
-        key = (min(i, j), max(i, j))
+        key = (int(min(i, j)), int(max(i, j)))
         if key in edge_weights:
             edge_weights[key] = alpha * edge_weights[key] + (1.0 - alpha) * w_prox
         else:
@@ -315,14 +450,16 @@ def run_hierarchical_community_detection(
     num_levels: int = 5,
     low_percentile: float = 10.0,
     high_percentile: float = 80.0,
-    min_community_size: int = 64,
+    min_community_size: int = 8,
+    init_single: bool = True,
+    min_contiguous_frames_per_level: Sequence[int] | None = None,
 ) -> np.ndarray:
     """Hierarchical community detection that splits each parent community.
 
-    Level 0 runs Louvain once on the full graph. Higher levels re-cluster each
-    parent community's induced subgraph using a thresholded edge set so that
-    children are always contained within their parent community. The
-    ``min_community_size`` guard prevents over-fragmentation and
+    Level 0 starts from a single community by default. Higher levels re-cluster
+    each parent community's induced subgraph using a parent-relative threshold
+    on edge weights so that children are always contained within their parent
+    community. The ``min_community_size`` guard prevents over-fragmentation and
     ``low_percentile``/``high_percentile`` control the threshold sweep range.
     """
 
@@ -330,8 +467,10 @@ def run_hierarchical_community_detection(
     if n_vertices == 0:
         return np.zeros((num_levels, 0), dtype=int)
 
-    # Level 0: single community detection over the full graph.
-    if graph.ecount() == 0:
+    # Level 0: either a single root community or a flat detection.
+    if init_single:
+        labels0 = np.zeros(n_vertices, dtype=int)
+    elif graph.ecount() == 0:
         labels0 = np.arange(n_vertices, dtype=int)
     else:
         communities0 = graph.community_multilevel(weights=graph.es["weight"])
@@ -341,20 +480,22 @@ def run_hierarchical_community_detection(
     label_matrix[0] = labels0
     current_labels = labels0
 
-    # Prepare thresholds from the global edge weights.
-    if graph.ecount() == 0:
-        thresholds = np.zeros(max(num_levels - 1, 1), dtype=float)
+    # Prepare percentile schedule for deeper levels.
+    thresholds = np.linspace(low_percentile, high_percentile, max(num_levels - 1, 1))
+    if min_contiguous_frames_per_level is None:
+        contig_frames = [0] * (num_levels - 1)
     else:
-        weights = np.asarray(graph.es["weight"], dtype=float)
-        lo = float(np.percentile(weights, low_percentile))
-        hi = float(np.percentile(weights, high_percentile))
-        thresholds = np.linspace(lo, hi, max(num_levels - 1, 1))
+        contig_frames = list(min_contiguous_frames_per_level)
+        if len(contig_frames) < num_levels - 1:
+            contig_frames.extend([contig_frames[-1]] * (num_levels - 1 - len(contig_frames)))
 
     for level_idx in range(1, num_levels):
-        thr = thresholds[min(level_idx - 1, thresholds.size - 1)]
+        thr_percentile = thresholds[min(level_idx - 1, thresholds.size - 1)]
+        min_contig = contig_frames[min(level_idx - 1, len(contig_frames) - 1)]
         new_labels = np.empty(n_vertices, dtype=int)
         new_labels.fill(-1)
         next_label = 0
+        any_split = False
 
         for parent_id in np.unique(current_labels):
             nodes = np.where(current_labels == parent_id)[0]
@@ -369,6 +510,12 @@ def run_hierarchical_community_detection(
             subg = graph.induced_subgraph(nodes)
             weights_sub = np.asarray(subg.es["weight"], dtype=float)
 
+            if weights_sub.size == 0:
+                new_labels[nodes] = next_label
+                next_label += 1
+                continue
+
+            thr = float(np.percentile(weights_sub, thr_percentile))
             keep_idx = np.where(weights_sub >= thr)[0]
             if keep_idx.size == 0:
                 new_labels[nodes] = next_label
@@ -388,19 +535,62 @@ def run_hierarchical_community_detection(
             membership = np.asarray(communities.membership, dtype=int)
             uniq, counts = np.unique(membership, return_counts=True)
 
-            valid_clusters = counts[counts >= min_community_size]
-            if uniq.size < 2 or valid_clusters.size < 2:
+            cluster_sizes = {int(cid): int(count) for cid, count in zip(uniq, counts)}
+
+            max_run_per_cluster: dict[int, int] = {}
+            run_start = 0
+            for idx in range(1, membership.size):
+                contiguous = (
+                    membership[idx] == membership[idx - 1]
+                    and nodes[idx] == nodes[idx - 1] + 1
+                )
+                if not contiguous:
+                    cid = int(membership[run_start])
+                    run_len = idx - run_start
+                    max_run_per_cluster[cid] = max(
+                        max_run_per_cluster.get(cid, 0), run_len
+                    )
+                    run_start = idx
+            cid_last = int(membership[run_start])
+            max_run_per_cluster[cid_last] = max(
+                max_run_per_cluster.get(cid_last, 0), membership.size - run_start
+            )
+
+            min_size = max(min_community_size, 2)
+            valid_clusters = [
+                cid
+                for cid, count in cluster_sizes.items()
+                if count >= min_size and max_run_per_cluster.get(cid, 0) >= min_contig
+            ]
+            if len(valid_clusters) < 2:
                 new_labels[nodes] = next_label
                 next_label += 1
                 continue
 
-            for cluster_id in uniq:
+            any_split = True
+            largest_valid = max(valid_clusters, key=lambda cid: cluster_sizes[cid])
+            label_map: dict[int, int] = {}
+            for cluster_id in valid_clusters:
                 cluster_nodes_local = np.where(membership == cluster_id)[0]
                 cluster_nodes_global = nodes[cluster_nodes_local]
                 new_labels[cluster_nodes_global] = next_label
+                label_map[int(cluster_id)] = next_label
                 next_label += 1
 
+            for cluster_id in uniq:
+                if cluster_id in valid_clusters:
+                    continue
+                cluster_nodes_local = np.where(membership == cluster_id)[0]
+                cluster_nodes_global = nodes[cluster_nodes_local]
+                new_labels[cluster_nodes_global] = label_map[largest_valid]
+
         assert np.all(new_labels >= 0)
+        if not any_split:
+            label_matrix[level_idx] = current_labels
+            for remaining in range(level_idx + 1, num_levels):
+                label_matrix[remaining] = current_labels
+            break
+
         label_matrix[level_idx] = new_labels
         current_labels = new_labels
 
@@ -413,6 +603,17 @@ def DMSCOM(
     k: int = 10,
     alpha: float = 0.5,
     min_segment_frames: int | None = None,
+    min_segment_sec_per_level: float | Sequence[float] | None = None,
+    hop_sec: float | None = None,
+    min_split_sec_per_level: float | Sequence[float] | None = None,
+    exclude_radius: int = 0,
+    mutual_knn: bool = True,
+    min_rec_sim: float = 0.0,
+    chain_weight: float = 0.8,
+    chain_hops: int = 1,
+    init_single: bool = True,
+    max_dense_frames: int = 5000,
+    feature_slices: dict[str, tuple[int, int]] | None = None,
 ) -> np.ndarray:
     """Lightweight DMSCOM wrapper: from features to hierarchical label matrix.
 
@@ -429,6 +630,29 @@ def DMSCOM(
     min_segment_frames : int or None
         If not None and > 0, merge segments shorter than this many frames in
         each level (postprocessing in the time domain).
+    min_segment_sec_per_level : float | Sequence[float] | None
+        Minimum segment duration in seconds per level. Requires ``hop_sec``.
+    hop_sec : float | None
+        Effective hop duration in seconds for seconds-based postprocessing.
+    min_split_sec_per_level : float | Sequence[float] | None
+        Minimum contiguous run length required to consider a split valid, in
+        seconds. Converted to frames via ``hop_sec``.
+    exclude_radius : int
+        Number of frames to exclude around the diagonal when selecting recurrence edges.
+    mutual_knn : bool
+        If True, keep only mutual recurrence neighbors.
+    min_rec_sim : float
+        Minimum recurrence similarity to include an edge.
+    chain_weight : float
+        Weight for temporal chain edges.
+    chain_hops : int
+        Number of forward hops to connect with temporal chains.
+    init_single : bool
+        Whether to start the hierarchy from a single community.
+    max_dense_frames : int
+        Maximum frames allowed before dense similarity computation is aborted.
+    feature_slices : dict[str, tuple[int, int]] | None
+        Optional column ranges describing feature composition (e.g., chroma vs MFCC).
 
     Returns
     -------
@@ -440,13 +664,46 @@ def DMSCOM(
     if X.size == 0:
         return np.zeros((0, 0), dtype=int)
 
-    R, Delta = compute_similarity_matrices(X)
-    graph = build_graph_from_matrices(R, Delta, k=k, alpha=alpha)
+    contig_frames_per_level: Sequence[int] | None = None
+    if min_split_sec_per_level is not None and hop_sec is not None and hop_sec > 0:
+        if isinstance(min_split_sec_per_level, (float, int)):
+            contig_frames_per_level = [int(np.ceil(float(min_split_sec_per_level) / hop_sec))] * (
+                num_levels - 1
+            )
+        else:
+            sec_list = list(min_split_sec_per_level)
+            if len(sec_list) < num_levels - 1:
+                sec_list.extend([sec_list[-1]] * (num_levels - 1 - len(sec_list)))
+            contig_frames_per_level = [int(np.ceil(float(s) / hop_sec)) for s in sec_list[: num_levels - 1]]
+
+    R, Delta = compute_similarity_matrices(
+        X,
+        feature_slices=feature_slices,
+        max_proximity_hop=chain_hops,
+        max_dense_frames=max_dense_frames,
+    )
+    graph = build_graph_from_matrices(
+        R,
+        Delta,
+        k=k,
+        alpha=alpha,
+        exclude_radius=exclude_radius,
+        mutual_knn=mutual_knn,
+        min_rec_sim=min_rec_sim,
+        chain_weight=chain_weight,
+        chain_hops=chain_hops,
+    )
     label_matrix = run_hierarchical_community_detection(
         graph,
         num_levels=num_levels,
+        init_single=init_single,
+        min_contiguous_frames_per_level=contig_frames_per_level,
     )
-    if min_segment_frames is not None and min_segment_frames > 0:
+    if min_segment_sec_per_level is not None and hop_sec is not None:
+        label_matrix = postprocess_label_matrix_seconds(
+            label_matrix, hop_sec, min_segment_sec_per_level
+        )
+    elif min_segment_frames is not None and min_segment_frames > 0:
         label_matrix = postprocess_label_matrix(label_matrix, min_segment_frames)
     return label_matrix
 
@@ -614,9 +871,42 @@ def postprocess_label_matrix(label_matrix: np.ndarray, min_segment_frames: int) 
     return labels_copy
 
 
+def postprocess_label_matrix_seconds(
+    label_matrix: np.ndarray,
+    hop_sec: float,
+    min_segment_sec_per_level: float | Sequence[float],
+) -> np.ndarray:
+    """Postprocess label matrix enforcing minimum segment durations in seconds."""
+
+    labels_copy = np.asarray(label_matrix).copy()
+    if labels_copy.ndim != 2 or labels_copy.shape[1] == 0:
+        return labels_copy
+
+    if isinstance(min_segment_sec_per_level, (float, int)):
+        min_sec = [float(min_segment_sec_per_level)] * labels_copy.shape[0]
+    else:
+        min_sec = list(min_segment_sec_per_level)
+        if len(min_sec) != labels_copy.shape[0]:
+            if len(min_sec) == 0:
+                return labels_copy
+            # Extend last value if shorter than number of levels.
+            last_val = float(min_sec[-1])
+            min_sec = min_sec + [last_val] * (labels_copy.shape[0] - len(min_sec))
+
+    for level_idx, min_sec_val in enumerate(min_sec[: labels_copy.shape[0]]):
+        min_frames = int(np.ceil(min_sec_val / hop_sec))
+        if min_frames > 0:
+            labels_copy[level_idx] = merge_short_segments(
+                labels_copy[level_idx], min_frames
+            )
+
+    return labels_copy
+
+
 __all__ = [
     "TreeNode",
     "load_audio",
+    "extract_features_with_meta",
     "extract_features",
     "extract_features_from_path",
     "compute_similarity_matrices",
@@ -626,6 +916,7 @@ __all__ = [
     "DMSCOM",
     "merge_short_segments",
     "postprocess_label_matrix",
+    "postprocess_label_matrix_seconds",
     "ensure_dir",
     "save_numpy",
     "save_csv",
